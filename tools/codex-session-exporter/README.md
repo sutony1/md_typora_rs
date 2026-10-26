@@ -3,6 +3,10 @@
 将本地 Codex 会话导出为适合人类阅读、可用 Obsidian 打开的 Markdown。
 支持普通 `.jsonl` 和 Zstandard 压缩的 `.jsonl.zst`，可恢复附件图片。
 
+## 家里与学校的资料合并
+
+请按 [家里与学校 Codex 知识库操作指南](HOME_KNOWLEDGE_BASE_GUIDE_ZH.md) 操作：复制完整导出文件夹、导出家里的会话，再用 Obsidian 打开同一个知识库。指南还附有可直接交给 Codex 的项目整理提示词。
+
 ## Windows 快速开始
 
 1. 下载并解压本工具 ZIP 到任意文件夹。
