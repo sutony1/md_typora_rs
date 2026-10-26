@@ -1,0 +1,10 @@
+_deps/
+__pycache__/
+*.pyc
+export_check_*/
+导出结果/
+Codex知识库导出/
+*.jsonl
+*.jsonl.zst
+运行报告.json
+导出状态.json
