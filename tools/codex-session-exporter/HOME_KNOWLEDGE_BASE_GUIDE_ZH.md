@@ -26,7 +26,7 @@ C:\Users\suton\Desktop\澳门发明展2026\三极管spice参数测试仪\Codex�
 
 ## 第二步：在家里导出家里电脑的会话
 
-1. 下载 [Codex 会话导出工具 ZIP](https://github.com/sutony1/md_typora_rs/raw/refs/heads/master/tools/codex-session-exporter/codex-session-exporter-v1.1.zip)。
+1. 下载 [Codex 会话导出工具 ZIP](https://github.com/sutony1/md_typora_rs/raw/refs/heads/master/tools/codex-session-exporter/codex-session-exporter-v1.1.1.zip)。
 2. 解压到任意工具目录。
 3. 确认已安装 Python 3.10 或以上版本，并可执行 `python --version`。
 4. 首次使用，双击 **安装解压依赖.cmd**，等待安装成功；这一步需要联网。
