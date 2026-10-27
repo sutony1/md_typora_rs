@@ -2,6 +2,7 @@
 import base64
 import json
 import pathlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -12,8 +13,13 @@ HERE = pathlib.Path(__file__).resolve().parent
 
 
 class ExportTest(unittest.TestCase):
+    def run_export(self, command):
+        # A broken exporter must fail the test instead of consuming CPU indefinitely.
+        return subprocess.run(command, capture_output=True, encoding='utf-8', timeout=30)
+
     def test_recovery_dates_and_cache(self):
         work = pathlib.Path(tempfile.mkdtemp(prefix='export_check_', dir=HERE))
+        self.addCleanup(shutil.rmtree, work, ignore_errors=True)
         source = work/'source'
         source.mkdir()
         target = work/'output'
@@ -38,7 +44,7 @@ class ExportTest(unittest.TestCase):
         path = source/'fixture.jsonl'
         path.write_text('\n'.join(json.dumps(r,ensure_ascii=False) for r in records)+'\n',encoding='utf-8')
         command = [sys.executable,str(HERE/'codex_export.py'),str(source),'--output',str(target)]
-        first = subprocess.run(command,capture_output=True,encoding='utf-8')
+        first = self.run_export(command)
         self.assertEqual(first.returncode,0,first.stdout+first.stderr)
         report = json.loads((target/'运行报告.json').read_text(encoding='utf-8'))
         session = report['sessions'][0]
@@ -50,7 +56,7 @@ class ExportTest(unittest.TestCase):
         self.assertNotIn('data:image/',markdown)
         self.assertEqual(len(list((target/'fixture'/'images').glob('*.png'))),1)
         self.assertEqual(next((target/'fixture'/'images').glob('*.png')).read_bytes(),png)
-        second = subprocess.run(command,capture_output=True,encoding='utf-8')
+        second = self.run_export(command)
         self.assertEqual(second.returncode,0,second.stdout+second.stderr)
         self.assertEqual(json.loads((target/'运行报告.json').read_text(encoding='utf-8'))['skipped'],1)
         # Real Zstandard compression, including concatenated frames; the daily
@@ -65,7 +71,7 @@ class ExportTest(unittest.TestCase):
         packed_path.write_bytes(packed)
         compressed_target = work/'compressed_output'
         compressed_command = [sys.executable,str(HERE/'codex_export.py'),str(packed_path),'--output',str(compressed_target)]
-        run = subprocess.run(compressed_command,capture_output=True,encoding='utf-8')
+        run = self.run_export(compressed_command)
         self.assertEqual(run.returncode,0,run.stdout+run.stderr)
         self.assertEqual(packed_path.read_bytes(),packed)
         for original in (target/'fixture').glob('*_对话.md'):
@@ -81,7 +87,7 @@ class ExportTest(unittest.TestCase):
         (background/'guardian.jsonl.zst').write_bytes(zstd.ZstdCompressor().compress(data))
         bg_target = work/'background_output'
         bg_command = [sys.executable,str(HERE/'codex_export.py'),str(background),'--output',str(bg_target)]
-        run = subprocess.run(bg_command,capture_output=True,encoding='utf-8')
+        run = self.run_export(bg_command)
         self.assertEqual(run.returncode,0,run.stdout+run.stderr)
         bg_report = json.loads((bg_target/'运行报告.json').read_text(encoding='utf-8'))
         self.assertEqual(bg_report['successful'],0)
@@ -89,10 +95,10 @@ class ExportTest(unittest.TestCase):
         # A damaged archive must fail visibly rather than produce an empty success.
         broken = work/'broken.jsonl.zst'
         broken.write_bytes(b'not a zstandard frame')
-        run = subprocess.run([sys.executable,str(HERE/'codex_export.py'),str(broken),
-                              '--output',str(work/'broken_output')],capture_output=True,encoding='utf-8')
+        run = self.run_export([sys.executable,str(HERE/'codex_export.py'),str(broken),
+                               '--output',str(work/'broken_output')])
         self.assertEqual(run.returncode,1)
-        print('测试数据保留在：'+str(work))
+        print('测试数据将自动清理：'+str(work))
 
 
 if __name__ == '__main__':
