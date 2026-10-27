@@ -14,7 +14,8 @@ import io
 import os
 import sqlite3
 
-VERSION = '1.1.0'
+VERSION = '1.2.0'
+CACHE_SCHEMA = 1
 TZ = dt.timezone(dt.timedelta(hours=8))
 
 
@@ -33,7 +34,7 @@ def zstandard_module():
             raise RuntimeError('读取 .zst 需要解压库，请运行：python -m pip install zstandard') from error
 
 
-def source_lines(source, snapshot=None):
+def source_lines(source, snapshot=None, start=0):
     """Yield decompressed lines without creating a temporary uncompressed archive."""
     source = pathlib.Path(source)
     with source.open('rb') as raw:
@@ -45,7 +46,8 @@ def source_lines(source, snapshot=None):
                 with io.BufferedReader(decoder) as stream:
                     yield from stream
         else:
-            remaining = snapshot or source.stat().st_size
+            raw.seek(start)
+            remaining = (snapshot or source.stat().st_size) - start
             while remaining > 0:
                 line = raw.readline(remaining)
                 if not line:
@@ -108,7 +110,7 @@ def is_background(metadata):
     return isinstance(source, dict) and ('subagent' in source or 'guardian' in source)
 
 
-def export_one(source, destination, snapshot=None, metadata=None):
+def export_one(source, destination, snapshot=None, metadata=None, force=False):
     started = time.perf_counter()
     SOURCE = pathlib.Path(source).resolve()
     DEST = pathlib.Path(destination).resolve()
@@ -122,15 +124,58 @@ def export_one(source, destination, snapshot=None, metadata=None):
     SESSION = match.group(0) if match else SOURCE.stem
     NOW = dt.datetime.now(TZ)
     DEST.mkdir(parents=True, exist_ok=True)
-    if list(DEST.glob('*.md')):
-        backup = DEST / ('文字版备份_' + NOW.strftime('%Y%m%d_%H%M%S'))
-        backup.mkdir(exist_ok=True)
-        for existing in DEST.glob('*.md'):
-            shutil.copy2(existing, backup / existing.name)
+    backup = DEST / ('更新前备份_' + NOW.strftime('%Y%m%d_%H%M%S_%f'))
+    def save_text(path, text):
+        if path.is_file() and path.read_text(encoding='utf-8-sig') == text:
+            return False
+        if path.is_file():
+            backup.mkdir(exist_ok=True)
+            shutil.copy2(path, backup/path.name)
+        atomic_text(path, text, encoding='utf-8-sig')
+        return True
+
+    limit = snapshot or SOURCE.stat().st_size
+    cache = None
+    rebuild_reason = '首次导出或旧版本没有检查点'
+    cache_path = DEST / '.增量缓存.json'
+    if force:
+        rebuild_reason = '用户要求完整重建'
+    elif snapshot is not None:
+        rebuild_reason = '指定快照，完整读取'
+    elif SOURCE.name.endswith('.zst'):
+        rebuild_reason = '压缩档案变化，完整解压核对'
+    elif cache_path.is_file():
+        try:
+            candidate = json.loads(cache_path.read_text(encoding='utf-8'))
+            if candidate['schema'] != CACHE_SCHEMA or candidate['version'] != VERSION:
+                raise ValueError('检查点版本不兼容')
+            if candidate['source'] != str(SOURCE):
+                raise ValueError('源路径或存储格式变化')
+            offset = candidate['offset']
+            if not 0 <= offset <= limit or limit < candidate['observed_size']:
+                raise ValueError('源文件缩短')
+            if limit == candidate['observed_size'] and SOURCE.stat().st_mtime_ns != candidate['mtime_ns']:
+                raise ValueError('源文件原地修改')
+            if source_signature(SOURCE, offset) != candidate['signature']:
+                raise ValueError('源文件标识或检查点附近内容变化')
+            for name, checksum in candidate['outputs'].items():
+                path = DEST/name
+                if not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != checksum:
+                    raise ValueError('已有导出文件缺失或被修改')
+            cache = candidate
+            SESSION = cache['session_id']
+            for record in cache['records']:
+                dt.datetime.fromisoformat(record['when'])
+                if not all(key in record for key in ('role', 'text', 'line', 'ident', 'turn', 'event', 'phase', 'images')):
+                    raise ValueError('检查点中的消息不完整')
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            cache = None
+            rebuild_reason = str(error)
+
     IMAGES = DEST / 'images'
     IMAGES.mkdir(exist_ok=True)
-    image_manifest = []
-    image_by_hash = {}
+    image_manifest = list(cache['image_manifest']) if cache else []
+    image_by_hash = {r['sha256']:r['file'] for r in image_manifest}
 
     def store_image(data, label, origin, line):
         checksum = hashlib.sha256(data).hexdigest()
@@ -147,7 +192,8 @@ def export_one(source, destination, snapshot=None, metadata=None):
                 return None
             safe = re.sub(r'[^\w.-]', '_', pathlib.Path(label).stem)[:90] or 'image'
             name = safe + '_' + checksum[:12] + suffix
-            (IMAGES / name).write_bytes(data)
+            if not (IMAGES / name).is_file() or (IMAGES / name).read_bytes() != data:
+                (IMAGES / name).write_bytes(data)
             image_by_hash[checksum] = 'images/' + name
         relative = image_by_hash[checksum]
         image_manifest.append(dict(file=relative, source=origin, line=line, sha256=checksum))
@@ -204,14 +250,20 @@ def export_one(source, destination, snapshot=None, metadata=None):
         return clean('\n\n'.join(c.get('text', '') for c in (content or [])
                                  if isinstance(c, dict) and c.get('type', '').lower() in ('text', 'input_text', 'output_text')))
 
-    limit = snapshot or SOURCE.stat().st_size
     digest = hashlib.sha256()
-    records = []
-    errors = []
-    line_number = 0
-    read_bytes = 0
-    for raw in source_lines(SOURCE, snapshot):
+    records = [dict(r, when=dt.datetime.fromisoformat(r['when'])) for r in cache['records']] if cache else []
+    errors = list(cache['errors']) if cache else []
+    line_number = cache['line_number'] if cache else 0
+    start_offset = cache['offset'] if cache else 0
+    read_bytes = start_offset
+    new_bytes = 0
+    for raw in source_lines(SOURCE, snapshot if SOURCE.name.endswith('.zst') else limit, start_offset):
+        # A live writer may have stopped halfway through a JSON record. Replay
+        # this tail next time; never checkpoint past an unfinished line.
+        if not SOURCE.name.endswith('.zst') and not raw.endswith(b'\n'):
+            break
         read_bytes += len(raw)
+        new_bytes += len(raw)
         digest.update(raw)
         line_number += 1
         try:
@@ -297,12 +349,22 @@ def export_one(source, destination, snapshot=None, metadata=None):
             parts += [f"## {r['when']:%H:%M:%S} {name}{suffix}",
                       f"<!-- 来源 JSONL 第 {r['line']} 行；消息编号 {r['ident']} -->", body]
         target = DEST / filename
-        target.write_text('\n\n'.join(parts) + '\n', encoding='utf-8-sig')
+        save_text(target, '\n\n'.join(parts) + '\n')
         summary.append(dict(date=day, file=filename, messages=len(messages), bytes=target.stat().st_size))
 
-    index = ['# Codex 对话导出索引', f'会话编号：`{SESSION}`', f'原文件：`{SOURCE}`',
+    # A replacement source can remove dates. Preserve obsolete daily exports in
+    # the same backup instead of leaving them visible as current history.
+    expected_days = {row['file'] for row in summary}
+    for old in DEST.glob('*_对话.md'):
+        if old.name not in expected_days:
+            backup.mkdir(exist_ok=True)
+            old.replace(backup/old.name)
+    snapshot_hash = digest.hexdigest() if not cache else None
+    integrity_text = (f'解压内容 SHA-256：`{snapshot_hash}`。' if snapshot_hash else
+                      f'本次新增段 SHA-256：`{digest.hexdigest()}`；未重新计算全文哈希。')
+    index = ['# Codex 对话导出索引' , f'会话编号：`{SESSION}`', f'原文件：`{SOURCE}`',
              f'导出时间：{NOW:%Y-%m-%d %H:%M:%S}（北京时间）',
-             f'读取格式：{"Zstandard 压缩 JSONL" if SOURCE.name.endswith(".zst") else "JSONL"}；读取 JSONL {read_bytes:,} 字节；解压内容 SHA-256：`{digest.hexdigest()}`。',
+             f'读取格式：{"Zstandard 压缩 JSONL" if SOURCE.name.endswith(".zst") else "JSONL"}；累计读取 JSONL {read_bytes:,} 字节；{integrity_text}',
              '原文件只读打开，未作修改。导出期间仍可能有新消息追加，因此本目录是一份时间点快照。',
              '保留：用户文字、助手答复和进度说明、问答确认文字、时间及会话编号。',
              '排除：工具调用与输出、内部推理、系统／开发者提示、运行环境信息；图片编码解码为独立文件，优先使用仍存在的本机原图。',
@@ -313,8 +375,8 @@ def export_one(source, destination, snapshot=None, metadata=None):
         index.append(f"| {row['date']} | {row['messages']} | [{row['file']}]({row['file']}) |")
     index.append(f'\n未解析记录：{len(errors)} 条。' + (f' 行号：{errors}' if errors else ''))
     index.append(f'\n图片引用：{embedded_count} 处。图片存放在 `images/`，来源和校验信息见 `图片来源.json`。复制到其他电脑时，请保持整个导出目录结构不变。')
-    (DEST / '00_索引.md').write_text('\n\n'.join(index[:10]) + '\n\n' + '\n'.join(index[10:]) + '\n', encoding='utf-8-sig')
-    (DEST / '图片来源.json').write_text(json.dumps(image_manifest, ensure_ascii=False, indent=2), encoding='utf-8')
+    save_text(DEST / '00_索引.md', '\n\n'.join(index[:10]) + '\n\n' + '\n'.join(index[10:]) + '\n')
+    write_json(DEST / '图片来源.json', image_manifest)
 
     # Verify every generated file is readable and contains no embedded image data.
     for path in DEST.glob('*.md'):
@@ -326,18 +388,58 @@ def export_one(source, destination, snapshot=None, metadata=None):
     assert sum(r['messages'] for r in summary) == len(selected)
     report = {'directory':str(DEST), 'source':str(SOURCE), 'session_id':SESSION,
               'messages':len(selected), 'days':summary, 'parse_errors':errors,
-              'snapshot_bytes':limit, 'snapshot_sha256':digest.hexdigest(),
+              'snapshot_bytes':limit, 'snapshot_sha256':snapshot_hash,
+              'mode':'incremental' if cache else 'full', 'rebuild_reason':None if cache else rebuild_reason,
+              'read_from_offset':start_offset, 'bytes_read_this_run':new_bytes,
+              'checkpoint_offset':read_bytes if not SOURCE.name.endswith('.zst') else None,
+              'deferred_bytes':limit-read_bytes if not SOURCE.name.endswith('.zst') else 0,
               'jsonl_bytes':read_bytes, 'compressed':SOURCE.name.endswith('.zst'),
               'title':(metadata or {}).get('title',''), 'cwd':(metadata or {}).get('cwd',''),
               'image_references':embedded_count, 'image_files':len(image_by_hash),
               'elapsed_seconds':round(time.perf_counter()-started, 3)}
+    if snapshot is None and not SOURCE.name.endswith('.zst'):
+        outputs = [DEST/row['file'] for row in summary] + [DEST/'图片来源.json', DEST/'00_索引.md']
+        outputs += [DEST/name for name in set(image_by_hash.values())]
+        current_stat = SOURCE.stat()
+        checkpoint = {
+            'schema':CACHE_SCHEMA, 'version':VERSION, 'source':str(SOURCE),
+            'session_id':SESSION, 'offset':read_bytes, 'line_number':line_number,
+            'observed_size':limit,
+            # A source still being written must not be considered unchanged.
+            'mtime_ns':current_stat.st_mtime_ns if current_stat.st_size == limit else -1,
+            'signature':source_signature(SOURCE, read_bytes),
+            'outputs':{p.relative_to(DEST).as_posix():hashlib.sha256(p.read_bytes()).hexdigest() for p in outputs},
+            'records':[dict(r, when=r['when'].isoformat()) for r in records],
+            'errors':errors, 'image_manifest':image_manifest,
+        }
+        write_json(cache_path, checkpoint)
+    report['elapsed_seconds'] = round(time.perf_counter()-started, 3)
     return report
 
 
-def write_json(path, value):
-    temporary = path.with_suffix('.tmp')
-    temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2), encoding='utf-8')
+def source_signature(path, offset):
+    """Bounded append check: file identity and hashes around saved boundaries.
+
+    Detects replacement, truncation and common rewrites without rereading huge
+    image lines. Arbitrary edits inside an old prefix require --force to audit.
+    """
+    stat = path.stat()
+    with path.open('rb') as stream:
+        head = stream.read(min(offset, 4096))
+        stream.seek(max(0, offset-4096))
+        tail = stream.read(min(offset, 4096))
+    return {'device':stat.st_dev, 'inode':stat.st_ino,
+            'head':hashlib.sha256(head).hexdigest(), 'tail':hashlib.sha256(tail).hexdigest()}
+
+
+def atomic_text(path, value, encoding='utf-8'):
+    temporary = path.with_name(path.name + '.tmp')
+    temporary.write_text(value, encoding=encoding)
     temporary.replace(path)
+
+
+def write_json(path, value):
+    atomic_text(path, json.dumps(value, ensure_ascii=False, indent=2))
 
 
 def run_cli():
@@ -345,7 +447,7 @@ def run_cli():
     parser.add_argument('source', nargs='?', help='JSONL/JSONL.ZST 文件，或需要递归扫描的目录')
     parser.add_argument('--all', action='store_true', help='扫描本机 Codex sessions 和 archived_sessions')
     parser.add_argument('--output', '-o', default='Codex知识库导出', help='输出根目录（默认：当前目录/Codex知识库导出）')
-    parser.add_argument('--force', action='store_true', help='即使源文件未变化也重新导出')
+    parser.add_argument('--force', action='store_true', help='完整重建（忽略缓存和增量检查点），用于核对历史内容')
     parser.add_argument('--snapshot', type=int, help='只读取前 N 字节，用于复现旧快照；仅限单个文件')
     parser.add_argument('--compare', help='与先前导出目录比较每日 Markdown 及其引用图片')
     parser.add_argument('--include-background', action='store_true', help='同时导出后台审批/子代理会话（默认过滤）')
@@ -407,24 +509,39 @@ def run_cli():
                        'mtime_ns':stat.st_mtime_ns, 'snapshot':args.snapshot, 'version':VERSION,
                        'metadata':metadata.get(str(source),{})}
         cached = None
+        state = None
         if manifest_path.is_file() and not args.force:
             try:
                 state = json.loads(manifest_path.read_text(encoding='utf-8'))
                 expected = [folder/'00_索引.md'] + [folder/d['file'] for d in state['report']['days']]
                 provenance = json.loads((folder/'图片来源.json').read_text(encoding='utf-8'))
                 expected += [folder/i['file'] for i in provenance]
-                if state['fingerprint'] == fingerprint and all(p.is_file() for p in expected):
-                    cached = state['report']
+                if (state['fingerprint'] == fingerprint and all(p.is_file() for p in expected)
+                        and (source.name.endswith('.zst') or (folder/'.增量缓存.json').is_file())):
+                    if source.name.endswith('.zst'):
+                        cached = state['report']
+                    else:
+                        checkpoint = json.loads((folder/'.增量缓存.json').read_text(encoding='utf-8'))
+                        required = ('source', 'session_id', 'offset', 'line_number', 'observed_size',
+                                    'mtime_ns', 'signature', 'outputs', 'records', 'errors', 'image_manifest')
+                        if (checkpoint['schema'] == CACHE_SCHEMA and checkpoint['version'] == VERSION
+                                and all(key in checkpoint for key in required)
+                                and all((folder/name).is_file() and
+                                        hashlib.sha256((folder/name).read_bytes()).hexdigest() == checksum
+                                        for name, checksum in checkpoint['outputs'].items())):
+                            cached = state['report']
             except (OSError, ValueError, KeyError, TypeError):
                 pass
         try:
             if cached:
-                report = dict(cached, skipped=True)
+                report = dict(cached, skipped=True, mode='skipped', bytes_read_this_run=0)
                 print(f'[{number}/{len(files)}] 未变化，跳过：{source.name}', flush=True)
             else:
-                report = export_one(source, folder, args.snapshot, metadata.get(str(source)))
+                report = export_one(source, folder, args.snapshot, metadata.get(str(source)), force=args.force)
+                if stat.st_size != source.stat().st_size or stat.st_mtime_ns != source.stat().st_mtime_ns:
+                    fingerprint['mtime_ns'] = -1
                 write_json(manifest_path, {'fingerprint':fingerprint, 'report':report})
-                print(f"[{number}/{len(files)}] {report['messages']} 条消息，{report['image_references']} 处图片，"
+                print(f"[{number}/{len(files)}] {report['mode']}，本次读取 {report['bytes_read_this_run']:,} 字节；{report['messages']} 条消息，{report['image_references']} 处图片，"
                       f"{report['elapsed_seconds']:.3f} 秒：{source.name}", flush=True)
             reports.append(report)
         except Exception as error:
@@ -440,6 +557,8 @@ def run_cli():
     (root/'00_总索引.md').write_text('\n'.join(lines)+'\n', encoding='utf-8-sig')
     result = {'version':VERSION, 'elapsed_seconds':round(time.perf_counter()-started, 3),
               'successful':len(reports), 'skipped':sum(bool(r.get('skipped')) for r in reports),
+              'incremental':sum(r.get('mode') == 'incremental' for r in reports),
+              'bytes_read_this_run':sum(r.get('bytes_read_this_run', 0) for r in reports),
               'failures':failures, 'sessions':reports, 'filtered':filtered}
     if args.compare and reports:
         old = pathlib.Path(args.compare)

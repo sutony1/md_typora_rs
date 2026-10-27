@@ -2,6 +2,9 @@ _deps/
 __pycache__/
 *.pyc
 export_check_*/
+incremental_check_*/
+升级前备份_*/
+.增量缓存.json
 导出结果/
 Codex知识库导出/
 *.jsonl

@@ -13,7 +13,7 @@ if not "%~1"=="" goto dragged
 echo.
 echo Codex 对话导出工具
 echo 1. 选择一个 JSONL 或 JSONL.ZST 文件
-echo 2. 导出本机所有用户会话（自动过滤后台辅助记录）
+echo 2. 导出或增量更新本机所有用户会话（自动过滤后台辅助记录）
 echo 其他按键退出
 choice /c 12Q /n /m "请选择 [1/2/Q]："
 if errorlevel 3 exit /b 0
